@@ -1,0 +1,4 @@
+scriptine
+boto3
+requests
+logging

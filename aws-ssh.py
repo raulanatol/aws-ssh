@@ -1,16 +1,19 @@
 #!/usr/bin/env python
 import subprocess
 import requests
+import boto3
+import logging
+import re
 import os
 
-from cement.utils.misc import minimal_logger
-from ebcli.lib.ec2 import describe_instance
-from ebcli.lib.aws import set_profile, set_region, make_api_call
-from ebcli.resources.strings import strings, responses
-from ebcli.objects.exceptions import ServiceError, NoKeypairError, NotFoundError, CommandError
-from ebcli.core import io, fileoperations
-
-LOG = minimal_logger(__name__)
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+handler = logging.StreamHandler()
+handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(levelname)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+validate_ip = re.compile("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
 
 def get_public_ip():
@@ -18,101 +21,105 @@ def get_public_ip():
     return res.text + '/32'
 
 
-def _make_api_call(operation_name, **operation_options):
-    return make_api_call('ec2', operation_name, **operation_options)
+def get_ip_permissions(port, client_ip):
+    return {
+        "IpProtocol": "tcp",
+        "FromPort": port,
+        "ToPort": port,
+        "IpRanges": [
+            {
+                "CidrIp": client_ip
+            }
+        ]
+    }
 
 
-def _get_ssh_file(keypair_name):
-    key_file = fileoperations.get_ssh_folder() + keypair_name
-    if not os.path.exists(key_file):
-        if os.path.exists(key_file + '.pem'):
-            key_file += '.pem'
-        else:
-            raise NotFoundError(strings['ssh.filenotfound'].replace(
-                '{key-name}', keypair_name))
+def authorize_ssh(client, security_group_id, client_ip):
+    ip_permissions = [get_ip_permissions(22, client_ip)]
+    client.authorize_security_group_ingress(GroupId=security_group_id, IpPermissions=ip_permissions)
 
+
+def revoke_ssh(client, security_group_id, client_ip):
+    ip_permissions = [get_ip_permissions(22, client_ip)]
+    client.revoke_security_group_ingress(GroupId=security_group_id, IpPermissions=ip_permissions)
+
+
+def open_ssh(key_pair_file, user, ip):
+    custom_ssh = ['ssh', '-i', key_pair_file]
+    custom_ssh.extend([user + '@' + ip])
+
+    logging.info('Running ' + ' '.join(custom_ssh))
+    return_code = subprocess.call(custom_ssh)
+    if return_code != 0:
+        logging.info(custom_ssh[0] + ' returned exitcode: ' + str(return_code))
+        raise RuntimeError('An error occurred while running: ' + custom_ssh[0] + '.')
+
+
+def do_ssh(client, instance_id, key_pair_file, user):
+    client_ip = get_public_ip()
+    if not validate_ip.match(client_ip):
+        raise RuntimeError('Error getting the client public ip: ', client_ip)
+    instances = client.describe_instances(InstanceIds=[instance_id])
+    if len(instances['Reservations']) < 1:
+        raise RuntimeError('No instances found')
+    if len(instances['Reservations'][0]['Instances']) < 1:
+        raise RuntimeError('No instances found')
+    instance = instances['Reservations'][0]['Instances'][0]
+    if len(instance['SecurityGroups']) < 1:
+        raise RuntimeError('No security groups found')
+
+    # Get key_pair_file if null
+    if not key_pair_file:
+        key_pair_file = get_key_pair_filename(instance)
+
+    group_id = instance['SecurityGroups'][0]['GroupId']
+    ip = instance['PublicIpAddress']
+
+    authorize_ssh(client, group_id, client_ip)
+    try:
+        open_ssh(key_pair_file, user, ip)
+    except OSError:
+        RuntimeError('Error trying to open ssh connection')
+    finally:
+        revoke_ssh(client, group_id, client_ip)
+
+
+def get_key_pair_filename(instance):
+    pair_name = instance['KeyName']
+    sep = os.path.sep
+    ssh_folder = '~' + sep + '.ssh' + sep
+    ssh_folder = os.path.expanduser(ssh_folder)
+    if not os.path.exists(ssh_folder):
+        os.makedirs(ssh_folder)
+    key_file = ssh_folder + pair_name
+    if os.path.exists(key_file + '.pem'):
+        key_file += '.pem'
+    else:
+        raise RuntimeError('SSH file not found: ', key_file)
     return key_file
 
 
-def authorize_ssh(security_group_id, client_ip):
-    try:
-        _make_api_call('authorize_security_group_ingress',
-                       GroupId=security_group_id, IpProtocol='tcp',
-                       ToPort=22, FromPort=22, CidrIp=client_ip)
-    except ServiceError as e:
-        if e.code == 'InvalidPermission.Duplicate':
-            pass
-        else:
-            raise
-
-
-def revoke_ssh(security_group_id, client_ip):
-    try:
-        _make_api_call('revoke_security_group_ingress',
-                       GroupId=security_group_id, IpProtocol='tcp',
-                       ToPort=22, FromPort=22, CidrIp=client_ip)
-    except ServiceError as e:
-        if e.message.startswith(responses['ec2.sshalreadyopen']):
-            # ignore
-            pass
-        else:
-            raise
-
-
-def do_ssh(keypair_name, user, ip):
-    ident_file = _get_ssh_file(keypair_name)
-    custom_ssh = ['ssh', '-i', ident_file]
-    custom_ssh.extend([user + '@' + ip])
-
-    io.echo('INFO: Running ' + ' '.join(custom_ssh))
-    returncode = subprocess.call(custom_ssh)
-    if returncode != 0:
-        LOG.debug(custom_ssh[0] + ' returned exitcode: ' + str(returncode))
-        raise CommandError('An error occurred while running: ' + custom_ssh[0] + '.')
-
-
-def ssh_command(instance_id, profile, user='ec2-user', region='us-west-1'):
+def ssh_command(mode='profile', instance=None, profile=None, key=None, user='ec2-user', region='us-west-1', access=None, secret=None):
     """
     Secure ssh connection with ec2 server
 
-    :param instance_id: The instance id to connect
+    :param mode: profile or key_modes
+    :param instance: The instance id to connect
     :param profile: aws profile name
+    :param key: .pem file to connect
     :param user: The unix instance user
     :param region: Amazon region of instance to connect
+    :param access: AccessKeyId
+    :param secret: SecretAccessKey
     """
 
-    if profile:
-        set_profile(profile)
-    set_region(region)
-    client_ip = get_public_ip()
-    # TODO verify if valid public ip
-    instance = describe_instance(instance_id)
-    try:
-        keypair_name = instance['KeyName']
-    except KeyError:
-        raise NoKeypairError()
+    if mode == 'profile':
+        session = boto3.Session(profile_name=profile, region_name=region)
+        client = session.client('ec2')
+    else:
+        client = boto3.client('ec2', aws_access_key_id=access, aws_secret_access_key=secret, region_name=region)
 
-    try:
-        ip = instance['PublicIpAddress']
-    except KeyError:
-        raise NotFoundError(strings['ssh.noip'])
-
-    security_groups = instance['SecurityGroups']
-    # TODO verify length
-    group = security_groups[0]
-    group_id = group['GroupId']
-
-    io.echo(strings['ssh.openingport'])
-    authorize_ssh(group_id, client_ip)
-    io.echo(strings['ssh.portopen'])
-
-    try:
-        do_ssh(keypair_name, user, ip)
-    except OSError:
-        CommandError(strings['ssh.notpresent'])
-    finally:
-        revoke_ssh(group_id, client_ip)
-        io.echo(strings['ssh.closeport'])
+    do_ssh(client, instance, key, user)
 
 
 if __name__ == '__main__':
