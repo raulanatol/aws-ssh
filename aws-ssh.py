@@ -18,6 +18,8 @@ validate_ip = re.compile("^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$")
 
 def get_public_ip():
     res = requests.get('http://ipecho.net/plain')
+    if not validate_ip.match(res.text):
+        raise RuntimeError('Error getting the client public ip: ', res.text)
     return res.text + '/32'
 
 
@@ -57,8 +59,6 @@ def open_ssh(key_pair_file, user, ip):
 
 def do_ssh(client, instance_id, key_pair_file, user):
     client_ip = get_public_ip()
-    if not validate_ip.match(client_ip):
-        raise RuntimeError('Error getting the client public ip: ', client_ip)
     instances = client.describe_instances(InstanceIds=[instance_id])
     if len(instances['Reservations']) < 1:
         raise RuntimeError('No instances found')
