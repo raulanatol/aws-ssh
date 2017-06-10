@@ -1,4 +1,4 @@
-# aws-push
+# aws-ssh
 
 Secure ssh (authorize before and revoke after connect) to aws servers
 
