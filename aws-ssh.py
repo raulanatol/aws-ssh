@@ -6,6 +6,8 @@ import logging
 import re
 import os
 
+from botocore.exceptions import ClientError
+
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 handler = logging.StreamHandler()
@@ -37,8 +39,14 @@ def get_ip_permissions(port, client_ip):
 
 
 def authorize_ssh(client, security_group_id, client_ip):
-    ip_permissions = [get_ip_permissions(22, client_ip)]
-    client.authorize_security_group_ingress(GroupId=security_group_id, IpPermissions=ip_permissions)
+    try:
+        ip_permissions = [get_ip_permissions(22, client_ip)]
+        client.authorize_security_group_ingress(GroupId=security_group_id, IpPermissions=ip_permissions)
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidPermission.Duplicate':
+            pass
+        else:
+            raise e
 
 
 def revoke_ssh(client, security_group_id, client_ip):
